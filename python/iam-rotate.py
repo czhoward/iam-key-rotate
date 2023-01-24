@@ -22,6 +22,8 @@ from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 
+import json
+
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
@@ -98,10 +100,20 @@ def get_owner_email(client, username):
 
 # Save the access and the secret in Secrets Manager
 def store_keys(secret, username, access_key, secret_access_key):
-    response = secret.update_secret(
-        SecretId=username,
-        SecretString='{"access_key": access_key, "secret_access_key": secret_access_key}',
-    )
+    key_info = str(json.dumps([{"Access Key":access_key},{"Secret Key":secret_access_key}]))
+    try:
+        response = secret.update_secret(
+            SecretId=username,
+            SecretString=key_info
+        )
+        log.info("Updated secret for %s", username)
+    except ClientError:
+        response = secret.create_secret(
+            Name=username,
+            SecretString=key_info
+        )        
+        log.info("Secret creating secret for %s", username)
+    return response
 
 
 # Main code
@@ -166,7 +178,10 @@ def lambda_handler(event, context):
                 "Two access keys already. Screening existing access keys for user %s",
                 username,
             )
-            younger_access_key = access_keys[0]
+            # Determine which key is the younger and older
+            zero_key, one_key = access_keys[0], access_keys[1]
+            young_key_index, old_key_index = ((1, 0), (0, 1))[key_age(zero_key["CreateDate"]) <= key_age(one_key["CreateDate"])]
+            younger_access_key = access_keys[young_key_index]
             younger_access_key_age = key_age(younger_access_key["CreateDate"])
 
             if not is_access_key_ever_used(client, younger_access_key["AccessKeyId"]):
@@ -200,7 +215,7 @@ def lambda_handler(event, context):
                 if younger_access_key_age >= DELETE_OLD_ACCESS_KEY_AFTER:
                     logging.info(
                         "Deleting old key %s for user %s",
-                        access_keys[1]["AccessKeyId"],
+                        access_keys[old_key_index]["AccessKeyId"],
                         username,
                     )
                     client.delete_access_key(
@@ -209,12 +224,12 @@ def lambda_handler(event, context):
                 elif younger_access_key_age == EXPIRE_OLD_ACCESS_KEY_AFTER:
                     logging.info(
                         "Deactivating old key %s for user %s",
-                        access_keys[1]["AccessKeyId"],
+                        access_keys[old_key_index]["AccessKeyId"],
                         username,
                     )
                     client.update_access_key(
                         UserName=username,
-                        AccessKeyId=access_keys[1]["AccessKeyId"],
+                        AccessKeyId=access_keys[old_key_index]["AccessKeyId"],
                         Status="Inactive",
                     )
 
