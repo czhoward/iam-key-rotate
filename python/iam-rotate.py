@@ -4,7 +4,7 @@ Code to rotate the key of a user, selects users by TAG "KeyUser" only.
 Checks the user for single or multiple access keys. If a single access key
 will then check against the expiry date and if past, creates a new access key
 stores the key in Secrets Manager and emails the user to inform them to rotate
-they key in their environment.
+the key in their environment.
 
 If multiple access keys are found then checks the youngest key to see if it has
 been used.  If it has NOT been used then this code will do nothing.  If the new
@@ -13,7 +13,6 @@ defined number of days have passed, and then will be deleted after a further
 defined number of days has passed.
 
 TODO: Change or add storing keys in hashicorp vault
-    : Add handling for error conditions on secret store
 """
 
 import logging
@@ -29,20 +28,39 @@ log.setLevel(logging.INFO)
 
 
 # Send email notification
-def notify(sender, destination, subject, text, html):
+def notify(destination, access_key, username, reminder=None):
     """
-    :param sender: The source email account.
-    :param destination: The destination email account.
-    :param subject: The subject of the email.
-    :param text: The plain text version of the body of the email.
-    :param html: The HTML version of the body of the email.
-    :return: The ID of the message, assigned by Amazon SES.
-    """
-    client = boto3.client("sesv2")
-    """
+    Sends an email to inform user to rotate their access key, destination email
+    address is taken from the tag that identifies this account.
+
+    :param destination: TO email address
+    :param access_key: The new access key
+    :param username: The IAM username
+    :param reminder: optional if configured this is a reminder email
+    :returns: message id if send was successful
+    :raises: error if send was a failure
+
     Note: If your account is in the Amazon SES  sandbox, the source and
     destination email accounts must both be verified.
     """
+    client = boto3.client("sesv2")
+    sender = "your@email-address.com"  # FROM email address
+    body = (
+            "Access Key: "
+            + access_key
+            + "details have been stored in SecretsManager.  Please update your use."
+    )
+    html = (
+            "<p>Access Key: "
+            + access_key
+            + "<br/>"
+            + "details have been stored in SecretsManager.  Please update your use.<br/></p>"
+    )
+    if reminder:
+        subject = "Reminder: New access keys created for user " + username
+    else:
+        subject = "New access keys created for user " + username
+
     try:
         response = client.send_email(
             FromEmailAddress=sender,
@@ -50,7 +68,7 @@ def notify(sender, destination, subject, text, html):
             Content={
                 "Simple": {
                     "Subject": {"Data": subject},
-                    "Body": {"Text": {"Data": text}, "Html": {"Data": html}},
+                    "Body": {"Text": {"Data": body}, "Html": {"Data": html}},
                 }
             },
         )
@@ -64,7 +82,14 @@ def notify(sender, destination, subject, text, html):
 
 
 # Determine the number of days since the key was created
-def key_age(key_created_date):
+def key_age(key):
+    """
+    Function to determine the number of days a key has existed
+    in comparison to today.
+    :param key: Access key
+    :returns: integer of days, 0 if less than 1 day
+    """
+    key_created_date = key["CreateDate"]
     tz_info = key_created_date.tzinfo
     age = datetime.now(tz_info) - key_created_date
     log.info("key age %s", age)
@@ -76,21 +101,31 @@ def key_age(key_created_date):
     return int(key_age_str.split(",")[0].split(" ")[0])
 
 
-# Check to see if the key has been used.
-def is_access_key_ever_used(client, access_key):
-    x = client.get_access_key_last_used(AccessKeyId=access_key)
-    if "LastUsedDate" in x["AccessKeyLastUsed"].keys():
-        log.info("Access key %s has been used", access_key)
+def is_access_key_ever_used(key):
+    """
+    Check to see if there is a last date used for the key, if
+    there is then the key has been used, if there is not then
+    the key is still to be used
+    :param key: Access key last used
+    :returns: boolean
+    """
+    if "LastUsedDate" in key["AccessKeyLastUsed"].keys():
+        log.info("Access key %s has been used")
         return True
     else:
-        log.info("Access key %s has never been used", access_key)
+        log.info("Access key %s has never been used")
         return False
 
 
-# Get the email address of the key user based on a tag associated with
-# the user account.  This should be the email of the person who uses
-# the account access key rather than someone who manages the account
 def get_owner_email(client, username):
+    """
+    Get the email address of the key user based on a tag associated with
+    the user account.  This should be the email of the person who uses
+    the account access key rather than someone who manages the account
+    :param client: boto3 iam client connection
+    :param username: iam username
+    :returns: contents of tag KeyUser or nothing
+    """
     meta = client.list_user_tags(UserName=username)["Tags"]
     for i in meta:
         if i["Key"] == "KeyUser":
@@ -98,36 +133,111 @@ def get_owner_email(client, username):
             return i["Value"]
 
 
-# Save the access and the secret in Secrets Manager
-def store_keys(secret, username, access_key, secret_access_key):
-    key_info = str(json.dumps([{"Access Key":access_key},{"Secret Key":secret_access_key}]))
+def store_keys(client, username, access_key, secret_access_key):
+    """
+    Save the access key and the secret in Secrets Manager
+    If the secret already exists then update otherwise create
+    :param client: boto3 secret manager client connection
+    :param username: iam username
+    :param access_key: new access key for user
+    :param secret_access_key: new secret access key for user
+    :returns: boto3 response code
+    """
+    key_info = str(
+        json.dumps([{"Access Key": access_key}, {"Secret Key": secret_access_key}])
+    )
     try:
-        response = secret.update_secret(
-            SecretId=username,
-            SecretString=key_info
-        )
+        response = client.update_secret(SecretId=username, SecretString=key_info)
         log.info("Updated secret for %s", username)
     except ClientError:
-        response = secret.create_secret(
-            Name=username,
-            SecretString=key_info
-        )        
+        response = client.create_secret(Name=username, SecretString=key_info)
         log.info("Secret creating secret for %s", username)
     return response
 
 
-# Main code
+def rotate_key(client, email, username):
+    """
+    Account has a single access key at the moment and
+    that key is old enough to require rotating
+    :param client: iam client connection
+    :param email: email address of user to send to
+    :param username: iam username
+    :returns: result of created access key
+    """
+    client_secret = boto3.client("secretsmanager")
+    log.info("Only one access key defined. Creating a new access key")
+    x = client.create_access_key(UserName=username)["AccessKey"]  # create the key
+    access_key, secret_access_key = x["AccessKeyId"], x["SecretAccessKey"]
+    # store the keys in a Secret
+    store_keys(client_secret, username, access_key, secret_access_key)
+    notify(email, access_key, username)  # send email to user about change
+    return x
+
+
+def delete_key(access_key, client, username):
+    """
+    Delete existing access key
+    :param access_key: The access_key that will be deleted
+    :param client: boto3 iam client connection
+    :param username: iam username of account
+    """
+    log.info(
+        "Deleting old key %s for user %s",
+        access_key["AccessKeyId"],
+        username,
+    )
+    client.delete_access_key(
+        UserName=username, AccessKeyId=access_key["AccessKeyId"]
+    )
+
+
+def deactivate_key(access_key, client, username):
+    """
+    Set existing access key to deactivated state
+    :param access_key: The access_key that will be deactivated
+    :param client: boto3 iam client connection
+    :param username: iam username of account
+    """
+    log.info(
+        "Deactivating old key %s for user %s",
+        access_key["AccessKeyId"],
+        username,
+    )
+    client.update_access_key(
+        UserName=username,
+        AccessKeyId=access_key["AccessKeyId"],
+        Status="Inactive",
+    )
+
+
+def determine_key_order(access_keys):
+    """ Determine which key is the younger and older
+    :param access_keys: Expects a list of access keys to be passed
+    :returns: two individual access keys in order older, younger
+    """
+    young_key_index, old_key_index = ((1, 0), (0, 1))[
+        key_age(access_keys[0]) <= key_age(access_keys[1])
+        ]
+    return (
+        access_keys[old_key_index],
+        access_keys[young_key_index],
+    )
+
+
 def lambda_handler(event, context):
+    """
+    main lambda function
+    :param event: event-bridge generated event to call the function
+    :param context: null, not used
+    """
     log.info("RotateAccessKey: starting...")
     EXPIRE_OLD_ACCESS_KEY_AFTER = 10  # Likely 10 in production
     DELETE_OLD_ACCESS_KEY_AFTER = 20  # Likely 20 in production
     CREATE_NEW_ACCESS_KEY_AFTER = 80  # Likely 80 in production
     NEW_ACCESS_KEY_NOTIFY_WINDOW = [7, 14]  # Likely 7 and 14 in production
-    SENDER = "youremail@youremailprovider.com"
-    client = boto3.client("iam")
-    secret = boto3.client("secretsmanager")
+    client_iam = boto3.client("iam")
 
-    data = client.list_users()
+    data = client_iam.list_users()
     log.info(data)
 
     # Loop through IAM users
@@ -135,103 +245,49 @@ def lambda_handler(event, context):
         username = user["UserName"]
         log.info("username %s", username)
         email = get_owner_email(
-            client, username
+            client_iam, username
         )  # Check for key user email tag populated and skip if not defined
         if not email:
-            logging.info(
+            log.info(
                 "Skipping: Email address not found for access key user %s", username
             )
             continue
 
-        access_keys = client.list_access_keys(UserName=username)[
+        access_keys = client_iam.list_access_keys(UserName=username)[
             "AccessKeyMetadata"
-        ]  # get the access keys
+        ]
         if (
-            len(access_keys) == 1
-            and key_age(access_keys[0]["CreateDate"]) > CREATE_NEW_ACCESS_KEY_AFTER
+                len(access_keys) == 1
+                and key_age(access_keys[0]) > CREATE_NEW_ACCESS_KEY_AFTER
         ):
-            # Single access key and old enough to require rotating
-            log.info("Only one access key defined. Creating a new access key")
-            x = client.create_access_key(UserName=username)[
-                "AccessKey"
-            ]  # create the key
-            # compose the email elements and email
-            access_key, secret_access_key = x["AccessKeyId"], x["SecretAccessKey"]
-            body = (
-                "Access Key: "
-                + access_key
-                + "details have been stored in SecretsManager.  Please update your use."
-            )
-            html = (
-                "<p>Access Key: "
-                + access_key
-                + "<br/>"
-                + "details have been stored in SecretsManager.  Please update your use.<br/></p>"
-            )
-            subject = "New access keys created for user " + username
-            notify(SENDER, email, subject, body, html)
-            # store the keys in a Secret
-            store_keys(secret, username, access_key, secret_access_key)
+            # There is a single access key, and it has passed renewal age
+            rotate_key(client_iam, email, username)
         elif len(access_keys) == 2:
-            # There is more than one access key already - get details of newest access key
+            # There is more than one access key already - get details of the newest access key
             log.info(
                 "Two access keys already. Screening existing access keys for user %s",
                 username,
             )
-            # Determine which key is the younger and older
-            zero_key, one_key = access_keys[0], access_keys[1]
-            young_key_index, old_key_index = ((1, 0), (0, 1))[key_age(zero_key["CreateDate"]) <= key_age(one_key["CreateDate"])]
-            younger_access_key = access_keys[young_key_index]
-            younger_access_key_age = key_age(younger_access_key["CreateDate"])
+            (
+                old_access_key,
+                young_access_key,
+            ) = determine_key_order(access_keys)
 
-            if not is_access_key_ever_used(client, younger_access_key["AccessKeyId"]):
+            young_access_key_age = key_age(young_access_key)
+            if not is_access_key_ever_used(
+                    client_iam.get_access_key_last_used(AccessKeyId=young_access_key["AccessKeyId"])
+            ):
                 # Key has not been used, if necessary send a reminder
-                logging.info("User %s Access Key has not been used", username)
-                if younger_access_key_age in NEW_ACCESS_KEY_NOTIFY_WINDOW:
-                    old_key_expire_timeout = (
-                        EXPIRE_OLD_ACCESS_KEY_AFTER - younger_access_key_age
-                    )
-                    logging.info(
-                        "User %s has %s days to use this new key %s",
-                        username,
-                        old_key_expire_timeout,
-                        younger_access_key["AccessKeyId"],
-                    )
-                    body = (
-                        "You have "
-                        + str(old_key_expire_timeout)
-                        + " days to use the new access keys."
-                    )
-                    html = (
-                        "<p>You have <b>"
-                        + str(old_key_expire_timeout)
-                        + "</b> days to use the new access keys.</p>"
-                    )
-                    subject = "Please use the new access keys for " + username
-                    notify(SENDER, email, subject, body, html)
+                log.info("User %s Access Key has not been used", username)
+                if young_access_key_age in NEW_ACCESS_KEY_NOTIFY_WINDOW:
+                    notify(email, young_access_key, username, True)
             else:
                 # key has been used and can be deactivated or deleted on day X
-                logging.info("User %s Access Key has been used", username)
-                if younger_access_key_age >= DELETE_OLD_ACCESS_KEY_AFTER:
-                    logging.info(
-                        "Deleting old key %s for user %s",
-                        access_keys[old_key_index]["AccessKeyId"],
-                        username,
-                    )
-                    client.delete_access_key(
-                        UserName=username, AccessKeyId=access_keys[1]["AccessKeyId"]
-                    )
-                elif younger_access_key_age == EXPIRE_OLD_ACCESS_KEY_AFTER:
-                    logging.info(
-                        "Deactivating old key %s for user %s",
-                        access_keys[old_key_index]["AccessKeyId"],
-                        username,
-                    )
-                    client.update_access_key(
-                        UserName=username,
-                        AccessKeyId=access_keys[old_key_index]["AccessKeyId"],
-                        Status="Inactive",
-                    )
+                log.info("User %s Access Key has been used", username)
+                if young_access_key_age >= DELETE_OLD_ACCESS_KEY_AFTER:
+                    delete_key(old_access_key, client_iam, username)
+                elif young_access_key_age == EXPIRE_OLD_ACCESS_KEY_AFTER:
+                    deactivate_key(old_access_key, client_iam, username)
 
     log.info("Completed")
     return 0
