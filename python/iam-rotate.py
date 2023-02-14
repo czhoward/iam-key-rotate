@@ -44,7 +44,7 @@ def notify(destination, access_key, username, reminder=None):
     destination email accounts must both be verified.
     """
     client = boto3.client("sesv2")
-    sender = "your@email-address.com"  # FROM email address
+    sender = "czhoward@gmail.com"  # FROM email address
     body = (
             "Access Key: "
             + access_key
