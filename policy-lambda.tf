@@ -7,6 +7,7 @@ data "aws_iam_policy_document" "policy" {
       "iam:CreateAccessKey",
       "iam:DeleteAccessKey",
       "iam:GetAccessKeyLastUsed",
+      "iam:UpdateAccessKey",
       "iam:ListUsers",
       "iam:ListUserTags",
       "iam:ListAccessKeys",

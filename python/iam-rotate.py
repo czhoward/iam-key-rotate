@@ -44,7 +44,7 @@ def notify(destination, access_key, username, reminder=None):
     destination email accounts must both be verified.
     """
     client = boto3.client("sesv2")
-    sender = "czhoward@gmail.com"  # FROM email address
+    sender = "your@email-address.com"  # FROM email address
     body = (
             "Access Key: "
             + access_key
@@ -110,10 +110,10 @@ def is_access_key_ever_used(key):
     :returns: boolean
     """
     if "LastUsedDate" in key["AccessKeyLastUsed"].keys():
-        log.info("Access key %s has been used")
+        log.info("Access key has been used")
         return True
     else:
-        log.info("Access key %s has never been used")
+        log.info("Access key has never been used")
         return False
 
 
