@@ -15,6 +15,7 @@ defined number of days has passed.
 TODO: Change or add storing keys in hashicorp vault
 """
 
+import os
 import logging
 from datetime import datetime
 
@@ -26,15 +27,12 @@ import json
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-
-# Send email notification
-def notify(destination, access_key, username, reminder=None):
+def notify(destination, username, reminder=None):
     """
     Sends an email to inform user to rotate their access key, destination email
     address is taken from the tag that identifies this account.
 
     :param destination: TO email address
-    :param access_key: The new access key
     :param username: The IAM username
     :param reminder: optional if configured this is a reminder email
     :returns: message id if send was successful
@@ -46,15 +44,14 @@ def notify(destination, access_key, username, reminder=None):
     client = boto3.client("sesv2")
     sender = "your@email-address.com"  # FROM email address
     body = (
-            "Access Key: "
-            + access_key
-            + "details have been stored in SecretsManager.  Please update your use."
+            "A new Access Key has been generated for "
+            + username
+            + ".  Details have been stored in KMaaS.  Please update your use."
     )
     html = (
-            "<p>Access Key: "
-            + access_key
-            + "<br/>"
-            + "details have been stored in SecretsManager.  Please update your use.<br/></p>"
+            "<p>A new Access Key has been generated for "
+            + username
+            + ".  Details have been stored in KMaaS.  Please update your use.<br/></p>"
     )
     if reminder:
         subject = "Reminder: New access keys created for user " + username
@@ -81,7 +78,6 @@ def notify(destination, access_key, username, reminder=None):
         return message_id
 
 
-# Determine the number of days since the key was created
 def key_age(key):
     """
     Function to determine the number of days a key has existed
@@ -155,6 +151,61 @@ def store_keys(client, username, access_key, secret_access_key):
     return response
 
 
+def store_key_in_vault(client, username, a_key, s_key):
+    """
+    TODO: Not in use yet, needs mechanism to decide secret manager or vault (or both)
+    Save the access key and the secret in KMaaS
+    If the secret already exists then update otherwise create
+    :param client: boto3 IAM client connection
+    :param username: iam username
+    :param a_key: new access key for user
+    :param s_key: new secret access key for user
+    """
+    url = os.getenv("VAULT_ADDR")
+    dns = url.split("/")[2]
+    namespace = os.getenv("VAULT_NAMESPACE")
+    role = os.getenv("VAULT_AUTH_ROLE")
+
+    # Set Vault Client Properties
+    vault = hvac.Client(
+        url=url,
+        token=None,
+        verify=False,
+        allow_redirects=True,
+        namespace=namespace,
+    )
+
+    # Vault client Login using AWS IAM Auth Method
+    vault.auth.aws.iam_login(
+        access_key=client.access_key,
+        secret_key=client.secret_key,
+        session_token=client.token,
+        header_value=dns,
+        role=role,
+        use_token=True,
+        mount_point="aws",
+    )
+
+    try:
+        vault.secrets.kv.v2.create_or_update_secret(
+            mount_point="secrets/",  # Secret Engine mount point
+            path=username,
+            secret=dict(access_key=a_key, secret_key=s_key),
+        )
+    except Forbidden:
+        log.error("Vault access forbidden")
+    except InvalidPath:
+        log.error("Vault access issue Invalid Path")
+    except Unauthorized:
+        log.error("Vault access Unauthorized")
+    except UnexpectedError:
+        log.error("Vault unexpected error")
+    except VaultDown:
+        log.error("Vault Down")
+    finally:
+        log.info("Keys stored in Vault")
+
+        
 def rotate_key(client, email, username):
     """
     Account has a single access key at the moment and
@@ -170,7 +221,7 @@ def rotate_key(client, email, username):
     access_key, secret_access_key = x["AccessKeyId"], x["SecretAccessKey"]
     # store the keys in a Secret
     store_keys(client_secret, username, access_key, secret_access_key)
-    notify(email, access_key, username)  # send email to user about change
+    notify(email, username)  # send email to user about change
     return x
 
 
@@ -181,14 +232,22 @@ def delete_key(access_key, client, username):
     :param client: boto3 iam client connection
     :param username: iam username of account
     """
-    log.info(
-        "Deleting old key %s for user %s",
-        access_key["AccessKeyId"],
-        username,
-    )
-    client.delete_access_key(
-        UserName=username, AccessKeyId=access_key["AccessKeyId"]
-    )
+    try:
+        client.delete_access_key(
+            UserName=username, AccessKeyId=access_key["AccessKeyId"]
+        )
+        log.info(
+            "Deleting old key %s for user %s",
+            access_key["AccessKeyId"],
+            username,
+        )
+    except ClientError:
+        log.exception(
+            "Failed to delete key %s for user %s",
+            access_key["AccessKeyId"],
+            username,
+        )
+        raise
 
 
 def deactivate_key(access_key, client, username):
@@ -198,16 +257,24 @@ def deactivate_key(access_key, client, username):
     :param client: boto3 iam client connection
     :param username: iam username of account
     """
-    log.info(
-        "Deactivating old key %s for user %s",
-        access_key["AccessKeyId"],
-        username,
-    )
-    client.update_access_key(
-        UserName=username,
-        AccessKeyId=access_key["AccessKeyId"],
-        Status="Inactive",
-    )
+    try:
+        client.update_access_key(
+            UserName=username,
+            AccessKeyId=access_key["AccessKeyId"],
+            Status="Inactive",
+        )
+        log.info(
+            "Deactivating old key %s for user %s",
+            access_key["AccessKeyId"],
+            username,
+        )
+    except ClientError:
+        log.exception(
+            "Failed to deactivate key %s for user %s",
+            access_key["AccessKeyId"],
+            username,
+        )
+        raise
 
 
 def determine_key_order(access_keys):
@@ -280,7 +347,7 @@ def lambda_handler(event, context):
                 # Key has not been used, if necessary send a reminder
                 log.info("User %s Access Key has not been used", username)
                 if young_access_key_age in NEW_ACCESS_KEY_NOTIFY_WINDOW:
-                    notify(email, young_access_key, username, True)
+                    notify(email, username, reminder=True)
             else:
                 # key has been used and can be deactivated or deleted on day X
                 log.info("User %s Access Key has been used", username)
