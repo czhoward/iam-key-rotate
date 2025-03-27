@@ -15,7 +15,7 @@ def notify(destination, username, reminder=None):
 
     message = (
         f"A new Access Key has been generated for {username}. "
-        f"Details have been stored in KMaaS. Please update your use."
+        f"Details have been stored in Vault. Please update your use."
     )
 
     subject = "New access keys created" if not reminder else "Reminder: New access keys created"
