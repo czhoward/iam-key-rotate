@@ -51,7 +51,7 @@ def notify(destination, username, reminder=None):
     html = (
             "<p>A new Access Key has been generated for "
             + username
-            + ".  Details have been stored in KMaaS.  Please update your use.<br/></p>"
+            + ".  Details have been stored in Vault.  Please update your use.<br/></p>"
     )
     if reminder:
         subject = "Reminder: New access keys created for user " + username
@@ -154,7 +154,7 @@ def store_keys(client, username, access_key, secret_access_key):
 def store_key_in_vault(client, username, a_key, s_key):
     """
     TODO: Not in use yet, needs mechanism to decide secret manager or vault (or both)
-    Save the access key and the secret in KMaaS
+    Save the access key and the secret in Vault
     If the secret already exists then update otherwise create
     :param client: boto3 IAM client connection
     :param username: iam username
